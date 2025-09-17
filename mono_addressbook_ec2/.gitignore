@@ -1,0 +1,12 @@
+/terraform/.terraform/
+/terraform.tfstate
+/.idea/
+/builds
+/terraform/.terraform.lock.hcl
+target
+sonarqube token
+keys
+cache
+awscli-env
+java-cicd.pem
+

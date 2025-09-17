@@ -1,0 +1,158 @@
+
+## Define stages
+# Defines the stages of the CI/CD pipeline
+stages:
+  - check-instance
+  - build
+#  - test
+#  - jfrog
+  - deploy
+#  - vulnerability-scan
+# Check EC2 instance job
+# Checks the EC2 instance before deployment
+check-vm:
+  stage: check-instance
+  tags:
+    - java-cicd-tomcat
+  before_script:
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID  # Configures AWS access key ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY  # Configures AWS secret access key
+    - aws configure set region $AWS_REGION  # Configures AWS region
+  script:
+    - echo "Checking EC2 instance..."
+    - INSTANCE_PUBLIC_IP=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=EC2-gitlab-cicd-java" --query "Reservations[*].Instances[*].PublicIpAddress" --output text)  # Retrieves the public IP address of the EC2 instance
+    - |
+        if [ -z "$INSTANCE_PUBLIC_IP" ]; then  # Check if the IP is empty
+          echo "EC2 instance does not exist, triggering Infra branch pipeline..."
+          curl -X POST --fail -F token=$TRIGGER_TOKEN -F ref=infra https://gitlab.com/api/v4/projects/46495338/trigger/pipeline
+          exit 1
+        else
+          echo "EC2 instance exists, proceeding with deployment..."
+        fi
+    - echo "$INSTANCE_PUBLIC_IP"
+    - echo "INSTANCE_PUBLIC_IP=$INSTANCE_PUBLIC_IP" >> $CI_PROJECT_DIR/.env  # Stores the public IP address in a .env file
+    - |
+      echo "Updating proxy.conf with EC2 instance IP..."
+      sed -i "s|ip-address|$INSTANCE_PUBLIC_IP|g" proxy.conf
+    - cat proxy.conf #  adding the ec2 public ip in nginx config file
+  artifacts:
+    paths:
+      - .env  # Saves the .env file containing the instance public IP as an artifact for later stages
+      - proxy.conf
+  when: manual
+
+# Build job
+# Compiles and builds the Java application and builds images and updates in gitlab registry
+build:
+  stage: build
+  tags:
+    - java-cicd-tomcat
+  script:
+    - echo "Building the Java application..."  # Displays a message indicating the start of the build process
+    - echo "Building the Docker images..."
+    - docker build -t registry.gitlab.com/om-projects/project-one/addressbook:latest -f dockerfile . # building java app docker file with deployment in tomcat inside container
+    - docker build -t registry.gitlab.com/om-projects/project-one/reverse-proxy:latest -f dockerfile1 . # building nginx docker file
+    - echo "Pushing the Docker images to GitLab container registry..."
+    - docker login -u $CI_JOB_TOKEN -p $CI_JOB_TOKEN registry.gitlab.com
+    - docker push registry.gitlab.com/om-projects/project-one/addressbook:latest
+    - docker push registry.gitlab.com/om-projects/project-one/reverse-proxy:latest
+  when: manual
+
+# Unit tests job
+# Runs unit tests for the Java application
+#unit-test:
+#  stage: test
+#  tags:
+#    - java-cicd-tomcat
+#  script:
+#    - echo "Running unit tests..."  # Displays a message indicating the start of unit tests
+#    - mvn test --quiet  # Executes Maven command to run unit tests
+#  when: manual
+
+# integration test job
+# Runs integration tests for the Java application
+#integration-test:
+#  stage: test
+#  tags:
+#    - java-cicd-tomcat
+#  script:
+#    - echo "Running unit tests..."  # Displays a message indicating the start of integration tests
+#    - mvn integration-test  # Using Maven Surefire Plugin
+#    - mvn verify  # Using Maven Failsafe Plugin
+#  when: manual
+# SonarQube check job
+# Performs code analysis using SonarQube
+#sonarqube-check:
+#  stage: test
+#  image: maven:3.6.3-jdk-11
+#  variables:
+#    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+#    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+#  cache:
+#    key: "${CI_JOB_NAME}"
+#    paths:
+#      - .sonar/cache  # Caches the analysis task results to speed up subsequent runs
+#  script:
+#    - echo "Running SonarQube analysis..."  # Displays a message indicating the start of SonarQube analysis
+#    - mvn verify sonar:sonar -Dsonar.projectKey=test-java-maven -Dsonar.projectName='test-java-maven'  # Runs the SonarQube analysis on the project
+#  allow_failure: true  # Allows the pipeline to continue even if the SonarQube analysis fails
+#  rules:
+#    - if: $CI_COMMIT_BRANCH == 'dev'  # Runs the job only for the main branch
+#  tags:
+#    - java-cicd-tomcat
+#  when: manual
+
+# Jfrog
+#jfrog:
+#  stage: jfrog
+#  tags:
+#    - java-cicd-tomcat
+#  script:
+#    - echo "Building and Pushing image to Jfrog"
+#    - sudo echo $JF_PASS | docker login -u $JF_USER --password-stdin $JF_URL
+#    - docker build -t addressbook.jfrog.io/addressbook-docker/addressbook_image .
+#    - docker push addressbook.jfrog.io/addressbook-docker/addressbook_image
+#    - echo "Building and Pushing war File"
+#    - sudo mvn clean install
+#    - jf rt u "target/*.war" "$JF_REPO_WAR" --url "$JF_REPO_URL" --access-token $JF_REPO_TOKEN
+#  when: manual
+
+# Deployment using docker and configuring with nginx-reverse proxy
+deploy:
+  stage: deploy
+  needs:
+    - job: check-vm
+      artifacts: true
+  tags:
+    - java-cicd-tomcat
+  script:
+    - echo "Deploying application to AWS EC2..."  # Displays a message indicating the start of deployment
+#    - sudo apt install -y sshpass  # Installs sshpass for passwordless SSH
+    - source $CI_PROJECT_DIR/.env # Loads the instance public IP from the .env file
+    - echo "$AWS_SSH_KEY" > aws-ssh.pem
+    - cat aws-ssh.pem
+    - chmod 600 aws-ssh.pem  # Sets permissions for the private key
+#    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo echo $password | sudo docker login -u $gitlab_user --password-stdin registry.gitlab.com"
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP \ "sudo docker login -u $GIT_USER -p $CI_JOB_TOKEN registry.gitlab.com"
+    - echo "Copying and running Nginx reverse proxy container..."  # Displays a message indicating the start of the Nginx container deployment
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker rm -f reverse-proxy"
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker pull registry.gitlab.com/om-projects/project-one/reverse-proxy:latest"  # Pulls the Nginx reverse proxy image
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker run -d -p 80:80 -p 443:443 --name reverse-proxy registry.gitlab.com/om-projects/project-one/reverse-proxy:latest"  # Runs the Nginx reverse proxy container
+    - echo "Copying and running Address Book container..."  # Displays a message indicating the start of the Address Book container deployment
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker rm -f addressbook-test"
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker rm -f addressbook"
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker pull registry.gitlab.com/om-projects/project-one/addressbook:latest"  # Pulls the Address Book image
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker run -d -p 8081:8080 --name addressbook registry.gitlab.com/om-projects/project-one/addressbook:latest" # Runs the Address Book container
+    - ssh -o StrictHostKeyChecking=no -i aws-ssh.pem ubuntu@$INSTANCE_PUBLIC_IP "sudo docker run -d -p 8082:8080 --name addressbook-test registry.gitlab.com/om-projects/project-one/addressbook:latest"
+    - echo "Deployment completed successfully!"  # Displays a message indicating the successful deployment
+    - echo "You can access the deployed application at:"  # Displays a message indicating the URL to access the application
+    - echo "http://$INSTANCE_PUBLIC_IP"  # Prints the URL to access the application
+    - echo "And for QA access through:"
+    - echo "http://$INSTANCE_PUBLIC_IP/test"
+  dependencies:
+    - check-vm
+  when: manual
+
+# Vulnerability scan job
+# Performs vulnerability scanning on the deployed web application
+
